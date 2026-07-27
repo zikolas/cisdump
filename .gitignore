@@ -1,0 +1,7 @@
+.DS_Store
+# Watcom build artifacts (CISDUMP.EXE is committed on purpose; these aren't)
+*.OBJ
+*.obj
+# local CIS captures - not published
+samples/
+*.BIN
