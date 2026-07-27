@@ -44,6 +44,8 @@ static unsigned char cisb(unsigned seg, unsigned i){ return *(unsigned char __fa
  * back down (via unmapwin). */
 static unsigned char sv02, sv03, sv06, svwin[6];
 static int win_base, we_powered, was_io, rdy_timeout;
+static int settle_polls, settle_unstable;
+#define SETTLE_POLLS 250                /* settle gate cap: 250 x 20ms = ~5s */
 
 static int free_memwin(unsigned char wen)      /* first disabled mem window, 0..4 */
 {
@@ -92,9 +94,33 @@ static int mapwin(unsigned seg)
        readable. A valid CIS never starts with the 0xFF end marker, so poll
        byte 0 until it appears (~5s max, ample headroom over the ~110ms seen),
        then give up - a genuinely blank CIS stays 0xFF. On a fast host this
-       exits on the first read and costs nothing. */
-    { int t; for (t = 0; t < 1000 && cisb(seg, 0) == 0xFF; t++) dly(5000); }
-    rdy_timeout = (cisb(seg, 0) == 0xFF);
+       exits on the first read and costs nothing.
+
+       1.1: byte 0 alone is NOT enough. There are two un-settled modes, and
+       only one of them is an FF wall: after a power CYCLE (residual charge,
+       short off-time) a PC110 returns UNSTABLE NON-FF GARBAGE instead -
+       "31 31 86 86" was caught sailing straight through a byte0-only gate.
+       So the gate is two-clause: byte 0 != FF AND the first four dense bytes
+       identical across two reads 20ms apart. An FF-ramp host waits on the
+       first clause, a garbage-ramp host on the second; a genuinely blank
+       card pays one full timeout and its verdict is then trustworthy. */
+    {
+        unsigned char a[4], b[4];
+        int t, k;
+        for (k = 0; k < 4; k++) a[k] = cisb(seg, k);
+        for (t = 0; t < SETTLE_POLLS; t++) {
+            dly(20000);                                  /* ~20ms */
+            for (k = 0; k < 4; k++) b[k] = cisb(seg, k);
+            if (b[0] != 0xFF) {                          /* clause 1 */
+                for (k = 0; k < 4 && a[k] == b[k]; k++) ;
+                if (k == 4) break;                       /* clause 2 */
+            }
+            for (k = 0; k < 4; k++) a[k] = b[k];         /* roll forward */
+        }
+        settle_polls = t;
+    }
+    rdy_timeout     = (cisb(seg, 0) == 0xFF);
+    settle_unstable = (!rdy_timeout && settle_polls >= SETTLE_POLLS);
     return 1;
 }
 
@@ -384,7 +410,7 @@ static int write_bin(unsigned seg, const char *fn, int len)
 
 static void usage(void)
 {
-    printf("CISDUMP - PCMCIA CIS reader/dumper (Intel 82365 PCIC @ 0x3E0)\n");
+    printf("CISDUMP 1.1 - PCMCIA CIS reader/dumper (Intel 82365 PCIC @ 0x3E0)\n");
     printf("Usage: CISDUMP [/FULL] [/BIN file] [/S n] [/LEN n] [/?]\n");
     printf("  /FULL /F   decode CONFIG(COR), CFTABLE(I/O,IRQ), FUNCID, +SUMMARY\n");
     printf("  /BIN file  write raw de-interleaved CIS bytes to <file>\n");
@@ -415,7 +441,7 @@ int main(int argc, char **argv)
     if (binlen < 1)   binlen = 512;
     if (binlen > 1024) binlen = 1024;
 
-    printf("CISDUMP - PCMCIA CIS reader/dumper\n");
+    printf("CISDUMP 1.1 - PCMCIA CIS reader/dumper\n");
     for (sock = 0; sock < 2; sock++) {
         if (socksel >= 0 && (int)sock != socksel) continue;
         sockoff = sock * 0x40;
@@ -426,9 +452,14 @@ int main(int argc, char **argv)
         else
             printf("  [card already %s: reading CIS live, leaving it untouched]\n",
                    was_io ? "enabled as I/O" : "powered");
+        if (settle_polls > 0)
+            printf("  [socket is slow: CIS settled after %d x 20ms]\n", settle_polls);
         if (rdy_timeout)
             printf("  [warning: CIS still all-FF after a 5s wait - blank CIS, or\n"
                    "   this host needs longer than that to bring the socket up]\n");
+        else if (settle_unstable)
+            printf("  [warning: CIS never held still over a 5s wait - the bytes below\n"
+                   "   are an un-settled read, NOT this card's CIS. Re-run it]\n");
         dumpcis(seg, full);
         if (binfile) write_bin(seg, binfile, binlen);
         unmapwin();                                      /* polite restore */
