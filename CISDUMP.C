@@ -206,7 +206,7 @@ static void parse_cftable(int full)
 {
     int p = 0, index, deflt, iface = -1, fs, npwr, i;
     long io_base = -1, io_len = -1;
-    int  io_lines = -1, irqno = -1, irqmask = -1;
+    int  io_lines = -1, irqno = -1, irqmask = -1, irqflags = 0;
 
     if (blen < 1) return;
     index = body[p] & 0x3F;
@@ -252,11 +252,17 @@ static void parse_cftable(int full)
         }
     }
 irqpart:
-    /* IRQ */
+    /* IRQ description structure - one flags byte, then an optional mask:
+     *   b7 Share  b6 Pulse  b5 Level  b4 Mask  b3-0 IRQ number
+     * When b4 (Mask) is set a 16-bit little-endian IRQ mask FOLLOWS and the
+     * low nibble is not an IRQ number - reading it as one prints a bogus
+     * fixed IRQ (the Canon CE303 says 30 00 0C = level, IRQ 10 or 11).      */
     if (fs & 0x10 && p < blen) {
         int ir = body[p++];
-        if (ir & 0x80) {                                   /* 2-byte IRQ mask */
-            if (p + 1 < blen) { irqmask = body[p] | (body[p + 1] << 8); p += 2; }
+        irqflags = ir & 0xE0;
+        if (ir & 0x10) {                                   /* 2-byte IRQ mask */
+            if (p + 1 < blen) irqmask = body[p] | (body[p + 1] << 8);
+            p += 2;
         } else {
             irqno = ir & 0x0F;
         }
@@ -274,18 +280,25 @@ emit:
         if (io_base >= 0)
             printf("      -> I/O 0x%lX..0x%lX (len %ld)\n",
                    io_base, io_base + io_len - 1, io_len);
-        if (irqmask >= 0) {
-            printf("      -> IRQ mask 0x%04X (", irqmask);
-            for (i = 0; i < 16; i++) if (irqmask & (1 << i)) printf(" %d", i);
-            printf(" )\n");
-        } else if (irqno >= 0) {
-            printf("      -> IRQ %d (fixed)\n", irqno);
+        if (irqmask >= 0 || irqno >= 0) {
+            printf("      -> IRQ ");
+            if (irqflags & 0x20) printf("level ");
+            if (irqflags & 0x40) printf("pulse ");
+            if (irqflags & 0x80) printf("shared ");
+            if (irqmask >= 0) {
+                printf("mask 0x%04X {", irqmask);
+                for (i = 0; i < 16; i++) if (irqmask & (1 << i)) printf(" %d", i);
+                printf(" }\n");
+            } else {
+                printf("%d (fixed)\n", irqno);
+            }
         }
     }
     /* remember the default (or first) entry for the SUMMARY line */
     if (deflt || !s_have_io) {
         if (io_base >= 0) { s_io_base = io_base; s_io_len = io_len; s_have_io = 1; }
-        if (irqmask >= 0)  s_irq = irqmask;
+        if (irqmask >= 0)       s_irq = irqmask;
+        else if (irqno >= 0)    s_irq = 1 << irqno;
         s_def_idx = index;
     }
 }

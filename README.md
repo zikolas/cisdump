@@ -64,7 +64,9 @@ CISDUMP [/FULL] [/BIN file] [/S n] [/LEN n] [/?]
 - **CISTPL_CONFIG** → the last configuration index and the **COR base address**
   in attribute space (plus the config-register presence mask).
 - **CISTPL_CFTABLE_ENTRY** → each configuration's index, default flag, decoded
-  **I/O base and length** (per range), and **IRQ** (a mask or a fixed number).
+  **I/O base and length** (per range), and **IRQ** — the level/pulse/shared
+  flags plus either the 16-bit interrupt mask expanded to an IRQ list, or a
+  fixed IRQ number.
 - **CISTPL_FUNCID** with a human name, **FUNCE**, **DEVICE**, **JEDEC**, and all
   **CISTPL_VERS_1** strings.
 - A one-line **SUMMARY**: `MANFID / function / COR / default cfg# / I/O range`.
