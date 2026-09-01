@@ -7,8 +7,8 @@ it — the fast way to identify a card and read the facts in its CIS:
 and each configuration's **I/O windows** and **IRQ** options. One ~17 KB
 `.EXE`, no Card Services or Socket Services required.
 
-Tested on an IBM PC110 (PCIC at `3E0h`); it should work on any 82365-compatible
-socket controller at that index.
+Tested on an IBM PC110 and a ThinkPad 235; it should work with any
+82365-compatible socket controller answering at `3E0/3E2/3E4/3E6`.
 
 ## Polite by default
 
@@ -24,6 +24,10 @@ after another enabler has configured the card as an I/O device — so CISDUMP:
   the enable byte precisely — so it never clobbers the enabler's I/O windows.
 - **Only powers down a card it powered up itself.** A card found already on is
   left on.
+- **Never asserts Vpp.** Vpp is the card's programming supply, and on flash it is
+  the interlock that makes a stray write physically unable to program or erase.
+  A reader has no business raising it, so the socket is powered with Vpp off;
+  `/VPP` exists for the rare card that will not read without it.
 - **Waits for the CIS to actually appear** after powering a socket. How long a
   freshly-powered socket takes to serve attribute memory is a property of the
   **host**, not the card: an IBM PC110 is ready within ~30 ms, while a ThinkPad
@@ -45,17 +49,36 @@ It tells you which path it took:
 ## Usage
 
 ```
-CISDUMP [/FULL] [/BIN file] [/S n] [/LEN n] [/?]
+CISDUMP [/FULL] [/COMMON] [/RAW] [/FORCE] [/VPP] [/BIN file] [/S n] [/LEN n] [/?]
 
   (default)   decoded tuple dump of every socket that has a card
   /FULL /F    also decode CONFIG (COR base), CFTABLE_ENTRY (index, I/O
               base+len, IRQ), FUNCID names, FUNCE, DEVICE, JEDEC, all
               VERS_1 strings, and print a one-line SUMMARY per card
-  /BIN file   also write the raw (de-interleaved) CIS bytes to <file>
-  /S n        only scan socket n (0 or 1)
+  /COMMON /C  read COMMON memory densely instead of attribute space —
+              for memory-only cards, and cards that ignore REG#
+  /RAW /R     do not de-interleave — read the window byte by byte
+  /FORCE      parse as tuples even when the window is not a CIS
+  /VPP        drive Vpp to Vcc while powering (off by default)
+  /BIN file   also write the bytes as read (honours /COMMON and /RAW)
+  /S n        only scan socket n (0–7, see Sockets below)
   /LEN n      number of CIS bytes for /BIN (default 512)
   /? /H       help
 ```
+
+### Sockets and controllers
+
+An 82365-class chip drives two sockets and answers at one of four index
+ports, so socket *n* lives on the chip at `0x3E0 + (n & ~1)`, bank
+`(n & 1) * 0x40` — the same numbering the DOS enablers use, so `/S` values
+agree with theirs. CISDUMP scans sockets 0–7 across `3E0/3E2/3E4/3E6` and
+checks each chip's identification register before touching it.
+
+That check matters: an absent controller floats every read to `0xFF`, which
+otherwise decodes as card-present *and* powered *and* I/O-configured, with an
+all-`FF` window to match — a complete and entirely fictional card. Not
+hypothetical: on a ThinkPad 235 the first bridge sits in CardBus mode, so
+`0x3E0` is dead while the second answers PCIC at `0x3E4` with the card on it.
 
 ### `/FULL` — decode, don't just dump
 
@@ -75,7 +98,34 @@ CISDUMP [/FULL] [/BIN file] [/S n] [/LEN n] [/?]
 
 `/BIN file` writes the de-interleaved CIS bytes to a file (default **512**
 bytes — enough to capture cards whose MANFID sits past offset 256; use `/LEN`
-to change).
+to change). It honours `/COMMON` and `/RAW`, so it can archive common memory
+or the undoubled window just as easily.
+
+### Cards with no CIS
+
+Not every card has one. Memory-only cards may carry none at all, and a card
+that ignores `REG#` serves its **common** memory into the attribute window —
+so the "CIS" you read is really the front of a filesystem. Parsing that as
+tuples invents plausible nonsense: one such card yields `TPL EB len 144` and a
+fabricated `FUNCID`.
+
+So CISDUMP classifies the window before believing it. A first byte that cannot
+open a real tuple chain stops the parse and says why, and the boot-sector case
+is named outright — every FAT volume opens with an x86 jump (`EB xx 90`), which
+read de-interleaved off a `REG#`-ignoring card arrives as `EB 90`:
+
+```
+  no CIS in this window. First 16 bytes: EB 90 53 4F 35 30 ...
+  -> x86 boot sector, not a tuple chain: this is a FAT volume.
+     Read from ATTRIBUTE space, so the card is ignoring REG# and
+     serving COMMON memory. No attribute memory means no CIS and
+     no COR: it cannot be configured as an I/O card - memory mode
+     only. Re-read it with /COMMON to see the bytes undoubled.
+```
+
+`/COMMON` then shows the sector properly — OEM, volume label and FAT type.
+A card whose attribute memory is genuinely blank is reported as blank rather
+than as a failure: that is a legitimate state, not an error.
 
 ## Build
 
