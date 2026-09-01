@@ -35,7 +35,7 @@ int main(void)
     if ((rd(0x01) & 0x0C) != 0x0C) { printf("no card in socket 0\n"); return 1; }
 
     t0 = ticks();
-    wr(0x02, 0x95); dly(20000);          /* power on 5V */
+    wr(0x02, 0xB0); dly(20000);          /* power on 5V */
     wr(0x03, 0x40); dly(10000);          /* mem mode, reset released */
 
     start = seg >> 8; stop = (seg >> 8) + 3;
