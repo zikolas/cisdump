@@ -209,11 +209,11 @@ static int  s_manf, s_prod, s_func;
 static long s_cor;
 static int  s_have_manf, s_have_func;
 static long s_io_base, s_io_len;
-static int  s_irq, s_def_idx, s_have_io;
+static int  s_irq, s_def_idx, s_have_io, s_have_default;
 
 static void reset_summary(void)
 {
-    s_have_manf = s_have_func = s_have_io = 0;
+    s_have_manf = s_have_func = s_have_io = s_have_default = 0;
     s_cor = -1; s_io_base = s_io_len = -1;
     s_irq = -1; s_def_idx = -1; s_func = -1;
 }
@@ -344,12 +344,20 @@ emit:
             }
         }
     }
-    /* remember the default (or first) entry for the SUMMARY line */
-    if (deflt || !s_have_io) {
+    /* SUMMARY: latch the FIRST default entry and let no later one replace it.
+       A card may flag several - in the CIS the bit means "supplies defaults for
+       the entries that follow", not "the preferred one" - and it is the first
+       that an enabler actually configures. The Roland SCP-55 flags both #1 and
+       #13; taking the last reported I/O 0xE0D0 while SCP55GO configures 0x330,
+       which is precisely the question this line exists to answer. With no
+       default anywhere, fall back to the first entry that carries I/O - and a
+       real default still supersedes that fallback. */
+    if (!s_have_default && (deflt || !s_have_io)) {
         if (io_base >= 0) { s_io_base = io_base; s_io_len = io_len; s_have_io = 1; }
         if (irqmask >= 0)       s_irq = irqmask;
         else if (irqno >= 0)    s_irq = 1 << irqno;
         s_def_idx = index;
+        if (deflt) s_have_default = 1;
     }
 }
 
@@ -548,7 +556,7 @@ static int write_bin(unsigned seg, const char *fn, int len)
 
 static void usage(void)
 {
-    printf("CISDUMP 1.3 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
+    printf("CISDUMP 1.4 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
     printf("Usage: CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/?]\n");
     printf("  /FULL /F   decode CONFIG(COR), CFTABLE(I/O,IRQ), FUNCID, +SUMMARY\n");
     printf("  /COMMON /C read COMMON memory densely, not attribute space -\n");
@@ -590,7 +598,7 @@ int main(int argc, char **argv)
     if (binlen < 1)   binlen = 512;
     if (binlen > 1024) binlen = 1024;
 
-    printf("CISDUMP 1.3 - PCMCIA CIS reader/dumper\n");
+    printf("CISDUMP 1.4 - PCMCIA CIS reader/dumper\n");
     for (sock = 0; sock < 8; sock++) {
         if (socksel >= 0 && (int)sock != socksel) continue;
         pcic    = PCIC_BASE + (sock & ~1);
