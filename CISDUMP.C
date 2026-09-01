@@ -8,12 +8,18 @@
  * identify any 16-bit PC Card and to plan enabler support (MANFID, FUNCID, the
  * COR address and the I/O / IRQ options live in the CIS).
  *
- * Usage:  CISDUMP [/FULL] [/BIN file] [/S n] [/LEN n] [/?]
+ * Usage:  CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/?]
  *   (default)   decoded tuple dump of every socket that has a card
  *   /FULL /F    also decode CONFIG (COR base), CFTABLE_ENTRY (index, I/O
  *               base+len, IRQ, power), FUNCID names, FUNCE, DEVICE, JEDEC,
  *               all VERS_1 strings, and print a one-line SUMMARY per card
- *   /BIN file   also write the raw (de-interleaved) CIS bytes to <file>
+ *   /COMMON /C  read COMMON memory densely instead of attribute space, for
+ *               memory-only cards and cards that ignore REG#
+ *   /RAW /R     do not de-interleave - read the window byte by byte
+ *   /FORCE      parse as tuples even when the window is not a CIS
+ *   /VPP        drive Vpp to Vcc while powering. OFF by default: Vpp is the
+ *               programming supply and a read-only tool should not assert it
+ *   /BIN file   also write the bytes as read (honours /COMMON and /RAW)
  *   /S n        only scan socket n (0 or 1)
  *   /LEN n      number of CIS bytes for /BIN (default 512)
  *   /?  /H      this help
@@ -32,8 +38,13 @@ static unsigned sockoff;
 static void wr(unsigned char i, unsigned char v){ outp(PCIC, i + sockoff); outp(PCIC + 1, v); }
 static unsigned char rd(unsigned char i){ outp(PCIC, i + sockoff); return (unsigned char)inp(PCIC + 1); }
 static void dly(unsigned n){ while (n--) inp(0x80); }              /* ~1us each */
-/* attribute memory: CIS byte i lives at window offset i*2 */
-static unsigned char cisb(unsigned seg, unsigned i){ return *(unsigned char __far *)MK_FP(seg, i * 2); }
+/* Attribute memory is byte-interleaved: CIS byte i lives at window offset i*2,
+   so the default stride is 2. /RAW and /COMMON read densely (stride 1) - a card
+   that ignores REG# serves common memory into the attribute window, and dense is
+   the only way to see those bytes as they really are. */
+static int rd_stride = 2;               /* 2 = de-interleaved, 1 = dense      */
+static int rd_attr   = 1;               /* 1 = attribute space (REG#), 0 = common */
+static unsigned char cisb(unsigned seg, unsigned i){ return *(unsigned char __far *)MK_FP(seg, i * rd_stride); }
 
 /* --- polite socket access -------------------------------------------------
  * Reading the CIS only needs attribute memory, which stays readable whenever
@@ -44,8 +55,24 @@ static unsigned char cisb(unsigned seg, unsigned i){ return *(unsigned char __fa
  * back down (via unmapwin). */
 static unsigned char sv02, sv03, sv06, svwin[6];
 static int win_base, we_powered, was_io, rdy_timeout;
-static int settle_polls, settle_unstable;
+static int settle_polls, settle_unstable, settle_capped;
+/* Power control (reg 0x02) spelled out, because the old magic 0x95 hid what it
+   was doing. Vpp1/Vpp2 are the card's PROGRAMMING supply; 0x95 drove BOTH to
+   Vcc on every card this read-only tool powered. On flash that removes the
+   hardware interlock which otherwise makes a stray write physically unable to
+   program or erase - and era flash erases on a 2-cycle 0x20/0xD0 sequence.
+   A reader has no business asserting Vpp, so it stays off unless asked. */
+#define PWR_OUT   0x80                  /* card output enable                 */
+#define PWR_AUTO  0x20                  /* auto power switch on card-detect   */
+#define VCC_5V    0x10                  /* Vcc = 5.0V (bits 4:3; 0x18 = 3.3V) */
+#define VPP1_VCC  0x01                  /* Vpp1 = Vcc   (0x02 would be 12V)   */
+#define VPP2_VCC  0x04                  /* Vpp2 = Vcc   (0x08 would be 12V)   */
+#define PWR_READ  (PWR_OUT|PWR_AUTO|VCC_5V)          /* Vpp OFF: the default  */
+#define PWR_VPP   (PWR_READ|VPP1_VCC|VPP2_VCC)       /* only with /VPP        */
+static int want_vpp;                    /* /VPP: some cards need Vpp to read  */
+
 #define SETTLE_POLLS 250                /* settle gate cap: 250 x 20ms = ~5s */
+#define SETTLE_FLOOR 15                 /* all-FF blank floor: 15 x 20ms = 300ms */
 
 static int free_memwin(unsigned char wen)      /* first disabled mem window, 0..4 */
 {
@@ -66,7 +93,7 @@ static int mapwin(unsigned seg)
     /* power up only if the socket is off AND not already I/O-configured        */
     /* (0x40 in status reg 0x01 = power-on).                                     */
     if (!(rd(0x01) & 0x40) && !was_io) {
-        wr(0x02, 0x95); dly(20000);             /* power on, 5V   (we own it)    */
+        wr(0x02, want_vpp ? PWR_VPP : PWR_READ); /* Vcc 5V, Vpp off (we own it)  */
         wr(0x03, 0x40); dly(10000);             /* mem mode, reset released      */
         we_powered = 1;
     }
@@ -77,7 +104,8 @@ static int mapwin(unsigned seg)
     for (i = 0; i < 6; i++) svwin[i] = rd(win_base + i);   /* save window regs    */
 
     start = seg >> 8; stop = (seg >> 8) + 3;
-    woff  = ((unsigned)(0 - (seg >> 8)) & 0x3FFF) | 0x4000;   /* 0x4000 = attribute space */
+    woff  = ((unsigned)(0 - (seg >> 8)) & 0x3FFF);
+    if (rd_attr) woff |= 0x4000;                /* 0x4000 = attribute space (REG#) */
     wr(win_base + 0, start & 0xFF); wr(win_base + 1, (start >> 8) & 0x3F);
     wr(win_base + 2, stop  & 0xFF); wr(win_base + 3, (stop  >> 8) & 0x3F);
     wr(win_base + 4, woff  & 0xFF); wr(win_base + 5, (woff  >> 8) & 0xFF);
@@ -111,9 +139,15 @@ static int mapwin(unsigned seg)
         for (t = 0; t < SETTLE_POLLS; t++) {
             dly(20000);                                  /* ~20ms */
             for (k = 0; k < 4; k++) b[k] = cisb(seg, k);
-            if (b[0] != 0xFF) {                          /* clause 1 */
-                for (k = 0; k < 4 && a[k] == b[k]; k++) ;
-                if (k == 4) break;                       /* clause 2 */
+            for (k = 0; k < 4 && a[k] == b[k]; k++) ;
+            if (k == 4) {                                /* clause 2: stable */
+                if (b[0] != 0xFF) break;                 /* clause 1: has data */
+                /* 1.2: all-FF AND stable. On an FF-ramp host the window also
+                   reads a stable FF while it is still coming up, so a blank
+                   verdict is only safe past a floor well clear of the ~110ms
+                   worst case we have measured. Memory-only cards with no CIS
+                   are a legitimate, common case - they must not pay 5s. */
+                if (t >= SETTLE_FLOOR) break;
             }
             for (k = 0; k < 4; k++) a[k] = b[k];         /* roll forward */
         }
@@ -121,6 +155,7 @@ static int mapwin(unsigned seg)
     }
     rdy_timeout     = (cisb(seg, 0) == 0xFF);
     settle_unstable = (!rdy_timeout && settle_polls >= SETTLE_POLLS);
+    settle_capped   = (settle_polls >= SETTLE_POLLS);
     return 1;
 }
 
@@ -372,6 +407,81 @@ static void decode(unsigned seg, int code, int off, int full)
     }
 }
 
+/* ---- what is actually in this window? ------------------------------------
+ * Not every card has a CIS. Memory-only cards (and hosts with memory-only
+ * sockets) may carry none at all, and a card that ignores REG# serves its
+ * COMMON memory into the attribute window instead - so the "CIS" you read is
+ * really the front of a filesystem. Parsing that as tuples invents plausible
+ * nonsense: a New Media PalmModem yields 'TPL EB len 144' and a fabricated
+ * FUNCID 40. Classify the bytes before believing them. */
+#define WIN_CIS     0                   /* a plausible tuple chain            */
+#define WIN_BLANK   1                   /* all-FF: no CIS present             */
+#define WIN_BOOTSEC 2                   /* x86 boot sector = a FAT volume     */
+#define WIN_NOTCIS  3                   /* something, but not a tuple chain   */
+static int win_kind;
+
+/* Codes a real CIS can legitimately open with. Everything else - notably the
+   vendor-unique 0x80-0xFE range - is not a first tuple. */
+static int plausible_first_tuple(int c)
+{
+    return c == 0x00 || c == 0x01 ||
+           (c >= 0x10 && c <= 0x23) ||          /* CHECKSUM..SWIL             */
+           (c >= 0x40 && c <= 0x46);            /* VERS_2..ORG                */
+}
+
+static int classify(unsigned seg)
+{
+    int c0 = cisb(seg, 0), c1 = cisb(seg, 1), c2 = cisb(seg, 2);
+    if (c0 == 0xFF) return WIN_BLANK;
+    /* Every FAT boot sector opens with an x86 jump: EB xx 90, or E9 xx xx.
+       Read de-interleaved off a card that ignores REG#, EB 3C 90 arrives as
+       EB 90 - that pair is the tell for this whole class of card. */
+    if (c0 == 0xEB && ((rd_stride == 2 && c1 == 0x90) ||
+                       (rd_stride == 1 && c2 == 0x90))) return WIN_BOOTSEC;
+    if (c0 == 0xE9) return WIN_BOOTSEC;
+    if (!plausible_first_tuple(c0)) return WIN_NOTCIS;
+    return WIN_CIS;
+}
+
+/* Print the OEM/label text a boot sector carries, skipping unprintables. */
+static void show_text(unsigned seg, int from, int len)
+{
+    int i;
+    for (i = from; i < from + len; i++) {
+        int c = cisb(seg, i);
+        putchar((c >= 0x20 && c < 0x7F) ? c : '.');
+    }
+}
+
+static void report_notcis(unsigned seg)
+{
+    int i;
+    printf("  no CIS in this window. First 16 bytes:");
+    for (i = 0; i < 16; i++) printf(" %02X", cisb(seg, i));
+    printf("\n");
+    if (win_kind == WIN_BOOTSEC) {
+        printf("  -> x86 boot sector, not a tuple chain: this is a FAT volume.\n");
+        if (rd_stride == 1) {                   /* dense: real FAT offsets   */
+            printf("     OEM '"); show_text(seg, 3, 8);
+            printf("'  label '"); show_text(seg, 0x2B, 11);
+            printf("'  type '"); show_text(seg, 0x36, 8); printf("'\n");
+        } else {                                /* half-sampled: fields halve */
+            printf("     half-sampled text: '"); show_text(seg, 1, 36);
+            printf("'\n");
+        }
+        if (rd_attr)
+            printf("     Read from ATTRIBUTE space, so the card is ignoring REG# and\n"
+                   "     serving COMMON memory. No attribute memory means no CIS and\n"
+                   "     no COR: it cannot be configured as an I/O card - memory mode\n"
+                   "     only. Re-read it with /COMMON to see the bytes undoubled.\n");
+    } else {
+        printf("  -> first byte %02X is not a valid opening tuple. Either this card\n"
+               "     has no CIS, or the window is not showing attribute memory.\n"
+               "     Try /COMMON (is it a memory card?) and /RAW. /FORCE parses anyway.\n",
+               cisb(seg, 0));
+    }
+}
+
 static void dumpcis(unsigned seg, int full)
 {
     int off = 0, i, code, link, guard = 0;
@@ -423,10 +533,17 @@ static int write_bin(unsigned seg, const char *fn, int len)
 
 static void usage(void)
 {
-    printf("CISDUMP 1.1 - PCMCIA CIS reader/dumper (Intel 82365 PCIC @ 0x3E0)\n");
-    printf("Usage: CISDUMP [/FULL] [/BIN file] [/S n] [/LEN n] [/?]\n");
+    printf("CISDUMP 1.2 - PCMCIA CIS reader/dumper (Intel 82365 PCIC @ 0x3E0)\n");
+    printf("Usage: CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/?]\n");
     printf("  /FULL /F   decode CONFIG(COR), CFTABLE(I/O,IRQ), FUNCID, +SUMMARY\n");
-    printf("  /BIN file  write raw de-interleaved CIS bytes to <file>\n");
+    printf("  /COMMON /C read COMMON memory densely, not attribute space -\n");
+    printf("             for memory-only cards, and cards that ignore REG#\n");
+    printf("  /RAW /R    do not de-interleave: read the window byte by byte\n");
+    printf("  /FORCE     parse as tuples even if it does not look like a CIS\n");
+    printf("  /VPP       drive Vpp to Vcc while powering (OFF by default - a\n");
+    printf("             reader should not assert programming voltage). Only\n");
+    printf("             for a card that will not read without it\n");
+    printf("  /BIN file  write the bytes as read (honours /COMMON and /RAW)\n");
     printf("  /S n       scan only socket n (0 or 1)\n");
     printf("  /LEN n     CIS bytes to write for /BIN (default 512)\n");
     printf("  /? /H      this help\n");
@@ -435,13 +552,17 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     unsigned sock, seg = 0xD000;
-    int full = 0, socksel = -1, binlen = 512, i;
+    int full = 0, socksel = -1, binlen = 512, i, force = 0;
     char *binfile = NULL;
 
     for (i = 1; i < argc; i++) {
         char *a = argv[i];
         if (a[0] == '/' || a[0] == '-') a++;
         if      (!stricmp(a, "FULL") || !stricmp(a, "F")) full = 1;
+        else if (!stricmp(a, "COMMON") || !stricmp(a, "C")) { rd_attr = 0; rd_stride = 1; }
+        else if (!stricmp(a, "RAW") || !stricmp(a, "R")) rd_stride = 1;
+        else if (!stricmp(a, "FORCE")) force = 1;
+        else if (!stricmp(a, "VPP")) want_vpp = 1;
         else if (!stricmp(a, "BIN")  || !stricmp(a, "B")) {
             if (i+1 < argc && argv[i+1][0] != '/' && argv[i+1][0] != '-') binfile = argv[++i];
             else binfile = "CIS.BIN";
@@ -454,7 +575,7 @@ int main(int argc, char **argv)
     if (binlen < 1)   binlen = 512;
     if (binlen > 1024) binlen = 1024;
 
-    printf("CISDUMP 1.1 - PCMCIA CIS reader/dumper\n");
+    printf("CISDUMP 1.2 - PCMCIA CIS reader/dumper\n");
     for (sock = 0; sock < 2; sock++) {
         if (socksel >= 0 && (int)sock != socksel) continue;
         sockoff = sock * 0x40;
@@ -465,15 +586,30 @@ int main(int argc, char **argv)
         else
             printf("  [card already %s: reading CIS live, leaving it untouched]\n",
                    was_io ? "enabled as I/O" : "powered");
+        if (rd(0x01) & 0x10) printf("  [card is write-protected (-WP asserted)]\n");
         if (settle_polls > 0)
             printf("  [socket is slow: CIS settled after %d x 20ms]\n", settle_polls);
-        if (rdy_timeout)
-            printf("  [warning: CIS still all-FF after a 5s wait - blank CIS, or\n"
-                   "   this host needs longer than that to bring the socket up]\n");
+        if (rdy_timeout && settle_capped)
+            printf("  [warning: still all-FF after a 5s wait - blank, or this host\n"
+                   "   needs longer than that to bring the socket up]\n");
         else if (settle_unstable)
             printf("  [warning: CIS never held still over a 5s wait - the bytes below\n"
                    "   are an un-settled read, NOT this card's CIS. Re-run it]\n");
-        dumpcis(seg, full);
+        win_kind = classify(seg);
+        if (win_kind == WIN_CIS || force) {
+            if (win_kind != WIN_CIS)
+                printf("  [/FORCE: parsing as tuples anyway - see the warning above]\n");
+            dumpcis(seg, full);
+        } else if (win_kind == WIN_BLANK) {
+            printf("  no CIS: %s reads all-FF%s.\n",
+                   rd_attr ? "attribute memory" : "common memory",
+                   settle_capped ? " and never settled" : " (settled)");
+            if (rd_attr)
+                printf("  -> a memory-only card with no CIS reads exactly like this.\n"
+                       "     Try /COMMON to see whether it carries data.\n");
+        } else {
+            report_notcis(seg);
+        }
         if (binfile) write_bin(seg, binfile, binlen);
         unmapwin();                                      /* polite restore */
     }
