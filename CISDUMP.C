@@ -20,7 +20,7 @@
  *   /VPP        drive Vpp to Vcc while powering. OFF by default: Vpp is the
  *               programming supply and a read-only tool should not assert it
  *   /BIN file   also write the bytes as read (honours /COMMON and /RAW)
- *   /S n        only scan socket n (0 or 1)
+ *   /S n        only scan socket n (0-7; chip at 3E0+(n&~1), bank (n&1))
  *   /LEN n      number of CIS bytes for /BIN (default 512)
  *   /?  /H      this help
  *
@@ -32,11 +32,26 @@
 #include <conio.h>
 #include <dos.h>
 
-#define PCIC 0x3E0
+/* An 82365-class chip drives two sockets and answers at one of four index
+   ports. Socket s lives on the chip at 0x3E0 + (s & ~1), bank (s & 1) * 0x40
+   - the same mapping the enablers use, so /S numbers agree with theirs.
+   1.3: NEVER assume a chip is there. An absent controller floats every read
+   to 0xFF, which reads back as card-present + powered + I/O-configured and
+   then as an all-FF window: a completely fabricated story about hardware
+   that is not present. Seen for real on a ThinkPad 235 whose first bridge is
+   in CardBus mode (0x3E0 dead) while the second answers PCIC at 0x3E4. */
+#define PCIC_BASE 0x3E0
+static unsigned pcic = PCIC_BASE;
 static unsigned sockoff;
 
-static void wr(unsigned char i, unsigned char v){ outp(PCIC, i + sockoff); outp(PCIC + 1, v); }
-static unsigned char rd(unsigned char i){ outp(PCIC, i + sockoff); return (unsigned char)inp(PCIC + 1); }
+static void wr(unsigned char i, unsigned char v){ outp(pcic, i + sockoff); outp(pcic + 1, v); }
+static unsigned char rd(unsigned char i){ outp(pcic, i + sockoff); return (unsigned char)inp(pcic + 1); }
+
+/* Identification/revision register: an 82365-class part answers 10xxxxxxb. */
+static int pcic_present(void)
+{
+    return (rd(0x00) & 0xC0) == 0x80;
+}
 static void dly(unsigned n){ while (n--) inp(0x80); }              /* ~1us each */
 /* Attribute memory is byte-interleaved: CIS byte i lives at window offset i*2,
    so the default stride is 2. /RAW and /COMMON read densely (stride 1) - a card
@@ -533,7 +548,7 @@ static int write_bin(unsigned seg, const char *fn, int len)
 
 static void usage(void)
 {
-    printf("CISDUMP 1.2 - PCMCIA CIS reader/dumper (Intel 82365 PCIC @ 0x3E0)\n");
+    printf("CISDUMP 1.3 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
     printf("Usage: CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/?]\n");
     printf("  /FULL /F   decode CONFIG(COR), CFTABLE(I/O,IRQ), FUNCID, +SUMMARY\n");
     printf("  /COMMON /C read COMMON memory densely, not attribute space -\n");
@@ -544,7 +559,7 @@ static void usage(void)
     printf("             reader should not assert programming voltage). Only\n");
     printf("             for a card that will not read without it\n");
     printf("  /BIN file  write the bytes as read (honours /COMMON and /RAW)\n");
-    printf("  /S n       scan only socket n (0 or 1)\n");
+    printf("  /S n       scan only socket n (0-7; chip 3E0+(n&~1), bank (n&1))\n");
     printf("  /LEN n     CIS bytes to write for /BIN (default 512)\n");
     printf("  /? /H      this help\n");
 }
@@ -552,7 +567,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     unsigned sock, seg = 0xD000;
-    int full = 0, socksel = -1, binlen = 512, i, force = 0;
+    int full = 0, socksel = -1, binlen = 512, i, force = 0, nfound = 0;
     char *binfile = NULL;
 
     for (i = 1; i < argc; i++) {
@@ -575,11 +590,20 @@ int main(int argc, char **argv)
     if (binlen < 1)   binlen = 512;
     if (binlen > 1024) binlen = 1024;
 
-    printf("CISDUMP 1.2 - PCMCIA CIS reader/dumper\n");
-    for (sock = 0; sock < 2; sock++) {
+    printf("CISDUMP 1.3 - PCMCIA CIS reader/dumper\n");
+    for (sock = 0; sock < 8; sock++) {
         if (socksel >= 0 && (int)sock != socksel) continue;
-        sockoff = sock * 0x40;
-        printf("=== Socket %u (PCIC 0x3E0, bank 0x%02X) ===\n", sock, sockoff);
+        pcic    = PCIC_BASE + (sock & ~1);
+        sockoff = (sock & 1) * 0x40;
+        if (!pcic_present()) {          /* no chip here - say nothing unless asked */
+            if (socksel >= 0)
+                printf("=== Socket %u ===\n  no 82365-class controller at 0x%03X\n",
+                       sock, pcic);
+            continue;
+        }
+        nfound++;
+        printf("=== Socket %u (PCIC 0x%03X, bank 0x%02X, ID %02X) ===\n",
+               sock, pcic, sockoff, rd(0x00));
         if (!mapwin(seg)) { printf("  (no card present)\n"); continue; }
         if (we_powered)
             printf("  [socket was off: powered up to read, will power back down]\n");
@@ -613,5 +637,9 @@ int main(int argc, char **argv)
         if (binfile) write_bin(seg, binfile, binlen);
         unmapwin();                                      /* polite restore */
     }
+    if (!nfound)
+        printf("No 82365-class PCIC found (scanned 3E0/3E2/3E4/3E6).\n"
+               "A bridge in CardBus mode does not answer here - its sibling may\n"
+               "still be in PCIC mode on a higher socket number.\n");
     return 0;
 }
