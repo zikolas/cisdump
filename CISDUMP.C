@@ -618,7 +618,15 @@ int main(int argc, char **argv)
         else
             printf("  [card already %s: reading CIS live, leaving it untouched]\n",
                    was_io ? "enabled as I/O" : "powered");
-        if (rd(0x01) & 0x10) printf("  [card is write-protected (-WP asserted)]\n");
+        /* Status bit 4 is pin 33, and that pin changes meaning with the
+           interface: -WP in the memory interface, but -IOIS16 in the I/O
+           interface (same repurposing as pin 16, RDY/BSY vs IREQ). So it
+           only means write-protect while the socket is in memory mode -
+           which is how we power a card up ourselves. On a card another
+           enabler has already configured as I/O, the bit is reporting bus
+           width and calling it write-protection is simply wrong. */
+        if (!was_io && (rd(0x01) & 0x10))
+            printf("  [card is write-protected (-WP asserted)]\n");
         if (settle_polls > 0)
             printf("  [socket is slow: CIS settled after %d x 20ms]\n", settle_polls);
         if (rdy_timeout && settle_capped)
