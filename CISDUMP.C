@@ -344,20 +344,26 @@ emit:
             }
         }
     }
-    /* SUMMARY: latch the FIRST default entry and let no later one replace it.
-       A card may flag several - in the CIS the bit means "supplies defaults for
-       the entries that follow", not "the preferred one" - and it is the first
-       that an enabler actually configures. The Roland SCP-55 flags both #1 and
-       #13; taking the last reported I/O 0xE0D0 while SCP55GO configures 0x330,
-       which is precisely the question this line exists to answer. With no
-       default anywhere, fall back to the first entry that carries I/O - and a
-       real default still supersedes that fallback. */
-    if (!s_have_default && (deflt || !s_have_io)) {
-        if (io_base >= 0) { s_io_base = io_base; s_io_len = io_len; s_have_io = 1; }
-        if (irqmask >= 0)       s_irq = irqmask;
-        else if (irqno >= 0)    s_irq = 1 << irqno;
+    /* SUMMARY, part 1 - the config index. Latch the FIRST default and let no
+       later one replace it. A card may flag several: in the CIS the bit means
+       "supplies defaults for the entries that follow", not "the preferred one",
+       and it is the first that an enabler programs into the COR. The Roland
+       SCP-55 flags both #1 and #13, and SCP55GO configures #1. */
+    if (!s_have_default && (deflt || s_def_idx < 0)) {
         s_def_idx = index;
         if (deflt) s_have_default = 1;
+    }
+    /* SUMMARY, part 2 - where the card actually lands. This cannot simply
+       follow the index, because a default entry is often a pure TEMPLATE:
+       zero address lines and base 0, meaning the host picks the address. The
+       KXL-C101's default #32 is exactly that, and ES1688GO goes on to place
+       the card at 220 from entry #36. Reporting 0x0..0x1F there would be a
+       placeholder dressed up as an answer, so take the first range that is
+       genuinely addressable, and take the IRQ from that same entry. */
+    if (!s_have_io && io_base > 0) {
+        s_io_base = io_base; s_io_len = io_len; s_have_io = 1;
+        if (irqmask >= 0)       s_irq = irqmask;
+        else if (irqno >= 0)    s_irq = 1 << irqno;
     }
 }
 
