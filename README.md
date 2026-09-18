@@ -4,11 +4,12 @@ A small, card-agnostic DOS tool that reads a 16-bit PC Card's **CIS**
 (Card Information Structure) through an Intel **82365-class PCIC** and decodes
 it — the fast way to identify a card and read the facts in its CIS:
 **MANFID**, **FUNCID**, the **COR** (Configuration Option Register) address,
-and each configuration's **I/O windows** and **IRQ** options. One ~17 KB
+and each configuration's **I/O windows** and **IRQ** options. One ~24 KB
 `.EXE`, no Card Services or Socket Services required.
 
 Tested on an IBM PC110 and a ThinkPad 235; it should work with any
-82365-compatible socket controller answering at `3E0/3E2/3E4/3E6`.
+82365-compatible socket controller answering at `3E0/3E2/3E4/3E6`. The
+prebuilt `CISDUMP.EXE` is in the repo and attached to each release.
 
 ## Polite by default
 
@@ -20,10 +21,10 @@ after another enabler has configured the card as an I/O device — so CISDUMP:
   was**: its power, reset, interface mode and IRQ steering are never touched.
 - **Borrows a free memory window** to reach attribute space: it scans the
   controller's window-enable register, picks the first *disabled* memory window,
-  saves that window's registers, reads, disables the borrowed window, then
-  restores the registers and enable byte. If all five memory windows are
-  occupied, it skips the socket without changing its state and returns a
-  nonzero exit status.
+  saves that window's registers, reads, then disables the borrowed window
+  before putting its registers and the enable byte back — so it never
+  clobbers the enabler's windows, not even for an instant. If all five memory
+  windows are in use it skips the socket without touching it.
 - **Only powers down a card it powered up itself.** A card found already on is
   left on.
 - **Never asserts Vpp.** Vpp is the card's programming supply, and on flash it is
@@ -51,7 +52,8 @@ It tells you which path it took:
 ## Usage
 
 ```
-CISDUMP [/FULL] [/COMMON] [/RAW] [/FORCE] [/VPP] [/BIN file] [/S n] [/LEN n] [/?]
+CISDUMP [/FULL] [/COMMON] [/RAW] [/FORCE] [/VPP] [/BIN file] [/S n] [/LEN n]
+        [/SEG xxxx] [/?]
 
   (default)   decoded tuple dump of every socket that has a card
   /FULL /F    also decode CONFIG (COR base), CFTABLE_ENTRY (index, I/O
@@ -62,14 +64,16 @@ CISDUMP [/FULL] [/COMMON] [/RAW] [/FORCE] [/VPP] [/BIN file] [/S n] [/LEN n] [/?
   /RAW /R     do not de-interleave — read the window byte by byte
   /FORCE      parse as tuples even when the window is not a CIS
   /VPP        drive Vpp to Vcc while powering (off by default)
-  /BIN file   also write the first card's bytes (honours /COMMON and /RAW);
-              refuse a second capture to the same filename
+  /BIN file   also write the bytes as read (honours /COMMON and /RAW);
+              first card only — a second card is refused, not overwritten
   /S n        only scan socket n (0–7, see Sockets below)
   /LEN n      number of CIS bytes for /BIN (default 512)
   /SEG xxxx   put the 16 KB card window at hex segment xxxx (C000–EC00,
               4 KB aligned; default D000)
   /? /H       help
 ```
+
+Exit status is 1 when a socket had to be skipped or a capture was refused.
 
 ### Sockets and controllers
 
@@ -94,10 +98,10 @@ as a tuple chain. That happened for real — on a ThinkPad 235 with a resident
 loaded high at D000 the "CIS" ended in that program's own banner text. So
 CISDUMP samples the segment before its window goes live and again once it has
 settled: identical non-`FF` bytes both ways mean host memory is in the way,
-and it says so and skips the socket rather than decode RAM. Move the window
-with `/SEG`, for example `/SEG DC00`. It also refuses a segment that an
-enabled PCIC window on either socket of the chip already covers — two windows
-decoding one range is undefined.
+and it says so and skips the socket rather than decode RAM (`/FORCE` reads it
+anyway). Move the window with `/SEG`, for example `/SEG DC00`. It also refuses
+a segment that an enabled PCIC window on either socket of the chip already
+covers — two windows decoding one range is undefined.
 
 ### `/FULL` — decode, don't just dump
 
@@ -111,19 +115,18 @@ decoding one range is undefined.
   fixed IRQ number.
 - **CISTPL_FUNCID** with a human name, **FUNCE**, **DEVICE**, **JEDEC**, and all
   **CISTPL_VERS_1** strings.
-- A one-line **SUMMARY**: `MANFID / function / COR / default cfg# / I/O range`.
+- A one-line **SUMMARY**: `MANFID / function / COR / cfg# / I/O range / IRQ
+  mask`. `cfg#` is the *first* default entry — the index an enabler writes to
+  the COR — and the I/O range comes from the first entry with a real base
+  address, since a default entry is often a pure template (`I/O 0x0..0x1F`).
 
-The reader scans the first **1024 bytes** of the selected memory space.
-It reports `LONGLINK_A`, `LONGLINK_C`, `LONGLINK_MFC`, and `INDIRECT`
-continuations as unsupported and labels the summary **partial**. When an
-attribute chain ends without a link or `NO_LINK`, it briefly maps common
-memory at offset zero and checks for a `LINKTARGET` tuple containing `CIS`.
-Only a valid target triggers an implicit-continuation warning and partial
-summary; otherwise the chain ends silently. The probe disables the window
-before changing its offset registers and restores the original mapping and
-read stride afterward. `/COMMON` can inspect common memory starting at zero;
-it does not follow arbitrary link targets.
-Reaching the scan limit before END is also reported as a partial dump.
+The walk covers the first 1024 bytes of the selected space. `LONGLINK_A/C/MFC`
+and `INDIRECT` continuations are not followed: they are reported and the
+SUMMARY is marked *partial*, as is a chain that runs into the scan limit. A
+chain that ends with neither a link tuple nor `NO_LINK` may continue in common
+memory, so CISDUMP does what the reference parser does: it looks at common
+offset 0 for a `LINKTARGET` carrying the `CIS` signature, warns only when one
+is there, and otherwise ends the chain silently.
 
 ### `/BIN` — archive the raw CIS
 
@@ -132,11 +135,10 @@ bytes — enough to capture cards whose MANFID sits past offset 256; use `/LEN`
 to change). It honours `/COMMON` and `/RAW`, so it can archive common memory
 or the undoubled window just as easily.
 
-`CISDUMP /FULL /BIN CARD.BIN` discovers the card without requiring its socket
-number. The first accessible card gets the filename. A second card is still
-decoded, but its capture is refused with a message and exit status 1, leaving
-the first file intact. To capture that card, use its reported socket number
-and a separate filename, for example `CISDUMP /S 4 /BIN CARD4.BIN`.
+`CISDUMP /FULL /BIN CARD.BIN` needs no socket number: the first card found
+takes the file. A second card is still decoded, but its capture is refused
+rather than overwriting the first — capture it by socket with another name,
+for example `CISDUMP /S 4 /BIN CARD4.BIN`.
 
 ### Cards with no CIS
 
@@ -179,14 +181,13 @@ The prebuilt `CISDUMP.EXE` in this repo is built from this source, on hardware.
 
 ### Host regression checks
 
-Run `python3 tests/run_tests.py` with a C compiler supporting AddressSanitizer
-and UndefinedBehaviorSanitizer (Clang or GCC). The runner checks C89 syntax,
-then compiles and executes the actual source against simulated PCIC registers
-and card memory. Build products and captures are created in a temporary
-directory. These checks cover window preservation, IRQ masks, CONFIG sizes,
-continuation probes/warnings, terminal `FF`-link tuple decoding, and `/BIN`
-discovery and overwrite prevention. They do not replace a
-16-bit Watcom build or testing on a physical card.
+`python3 tests/run_tests.py` (Clang or GCC with ASan/UBSan) checks the source
+as C89 with pedantic warnings, then runs the real source against simulated
+PCIC registers and card memory in a temporary directory: window preservation
+(no write ever lands on a live window, socket registers come back
+byte-identical), IRQ masks, CONFIG sizes, continuation probes, `FF`-link
+tuples, `/BIN`, shadow detection and `/SEG`. A guard, not a substitute for
+the Watcom build and a real card.
 
 ## How it works
 
@@ -201,8 +202,9 @@ reach for most: the COR/config-register block and the I/O options.
 
 Clean-room: built from the public **Intel 82365SL** register set and the
 **PCMCIA CIS tuple** specification (Card Metaformat / PC Card Standard, cross-
-checked against Ralf Brown's Interrupt List and the Linux `i82365` register
-definitions). No vendor driver code. It grew out of the throwaway `CISDUMP`
+checked against Ralf Brown's Interrupt List, the Linux `i82365` register
+definitions and the link-following rules of its CIS parser). No vendor driver
+code. It grew out of the throwaway `CISDUMP`
 probe used across several DOS PCMCIA enabler projects, generalized into a
 standalone tool.
 
