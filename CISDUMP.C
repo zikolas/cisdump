@@ -1,5 +1,5 @@
 /* CISDUMP.C - dump a PCMCIA card's CIS via the Intel 82365 PCIC.
- * Scans sockets 0 and 1 (PCIC at 0x3E0), maps a memory window onto the card's
+ * Scans sockets 0-7 (PCIC at 0x3E0/2/4/6), maps a memory window onto the card's
  * ATTRIBUTE memory, walks the CIS tuples and decodes them. Polite & read-only:
  * a card found already powered/enabled (e.g. configured by another enabler) is
  * read live and LEFT RUNNING - its power, reset, interface mode and IRQ are
@@ -8,7 +8,7 @@
  * identify any 16-bit PC Card and to plan enabler support (MANFID, FUNCID, the
  * COR address and the I/O / IRQ options live in the CIS).
  *
- * Usage:  CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/?]
+ * Usage:  CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/SEG xxxx] [/?]
  *   (default)   decoded tuple dump of every socket that has a card
  *   /FULL /F    also decode CONFIG (COR base), CFTABLE_ENTRY (index, I/O
  *               base+len, IRQ, power), FUNCID names, FUNCE, DEVICE, JEDEC,
@@ -19,9 +19,11 @@
  *   /FORCE      parse as tuples even when the window is not a CIS
  *   /VPP        drive Vpp to Vcc while powering. OFF by default: Vpp is the
  *               programming supply and a read-only tool should not assert it
- *   /BIN file   also write the bytes as read (honours /COMMON and /RAW)
+ *   /BIN file   also write the bytes as read (honours /COMMON and /RAW; first card only)
  *   /S n        only scan socket n (0-7; chip at 3E0+(n&~1), bank (n&1))
  *   /LEN n      number of CIS bytes for /BIN (default 512)
+ *   /SEG xxxx   put the 16K card window at hex segment xxxx (C000-EC00, 4K
+ *               aligned; default D000) - for when a UMB or EMS frame sits there
  *   /?  /H      this help
  *
  * Build: C:\WATCOM\BLD.BAT CISDUMP
@@ -71,6 +73,7 @@ static unsigned char cisb(unsigned seg, unsigned i){ return *(unsigned char __fa
 static unsigned char sv02, sv03, sv06, svwin[6];
 static int win_base, we_powered, was_io, rdy_timeout;
 static int settle_polls, settle_unstable, settle_capped;
+static int win_shadowed;                /* host RAM answers at seg, not the card */
 /* Power control (reg 0x02) spelled out, because the old magic 0x95 hid what it
    was doing. Vpp1/Vpp2 are the card's PROGRAMMING supply; 0x95 drove BOTH to
    Vcc on every card this read-only tool powered. On flash that removes the
@@ -93,16 +96,43 @@ static int free_memwin(unsigned char wen)      /* first disabled mem window, 0..
 {
     int n;
     for (n = 0; n < 5; n++) if (!(wen & (1 << n))) return n;
-    return 0;                                   /* none free: reuse #0 (saved/restored) */
+    return -1;                                  /* never borrow an active window */
+}
+
+/* 1.5: two enabled windows decoding one system range is undefined, so refuse
+   a segment that any enabled memory window on EITHER socket of this chip
+   already covers (the start/stop regs hold address bits 23:12). */
+static int win_overlaps(unsigned seg)
+{
+    unsigned save = sockoff, bank, lo = seg >> 8, hi = (seg >> 8) + 3;
+    unsigned char wen;
+    int n, hit = 0;
+    for (bank = 0; bank <= 0x40 && !hit; bank += 0x40) {
+        sockoff = bank;
+        wen = rd(0x06);
+        for (n = 0; n < 5 && !hit; n++) {
+            unsigned base = 0x10 + n * 8, start, stop;
+            if (!(wen & (1 << n))) continue;
+            start = rd(base + 0) | ((rd(base + 1) & 0x0F) << 8);
+            stop  = rd(base + 2) | ((rd(base + 3) & 0x0F) << 8);
+            if (start <= hi && stop >= lo) hit = 1;
+        }
+    }
+    sockoff = save;
+    return hit;
 }
 
 static int mapwin(unsigned seg)
 {
     unsigned start, stop, woff;
+    unsigned char pre[16];
     int wn, i;
     if ((rd(0x01) & 0x0C) != 0x0C) return 0;    /* card-detect: not present */
 
     sv02 = rd(0x02); sv03 = rd(0x03); sv06 = rd(0x06);
+    wn = free_memwin(sv06);
+    if (wn < 0) return -1;                     /* fail before changing any state */
+    if (win_overlaps(seg)) return -2;          /* range already decoded: ditto  */
     was_io = (sv03 & 0x20) != 0;                /* 0x20 = configured as an I/O card */
     we_powered = 0;
     /* power up only if the socket is off AND not already I/O-configured        */
@@ -114,7 +144,6 @@ static int mapwin(unsigned seg)
     }
     /* else: leave power / reset / interface mode / IRQ exactly as found         */
 
-    wn = free_memwin(sv06);
     win_base = 0x10 + wn * 8;                   /* mem window wn regs: 0x10+wn*8  */
     for (i = 0; i < 6; i++) svwin[i] = rd(win_base + i);   /* save window regs    */
 
@@ -124,6 +153,13 @@ static int mapwin(unsigned seg)
     wr(win_base + 0, start & 0xFF); wr(win_base + 1, (start >> 8) & 0x3F);
     wr(win_base + 2, stop  & 0xFF); wr(win_base + 3, (stop  >> 8) & 0x3F);
     wr(win_base + 4, woff  & 0xFF); wr(win_base + 5, (woff  >> 8) & 0xFF);
+    /* 1.5: sample the segment BEFORE our window goes live. If the same non-FF
+       bytes come back once it is enabled and settled, the CPU never reached
+       the card: host memory (a UMB or EMS page frame) is shadowing the range
+       and "the CIS" would be whatever resident sits there. Seen for real on
+       a ThinkPad 235 with a resident loaded high at D000 - its banner text
+       came out as a tuple chain. */
+    for (i = 0; i < 16; i++) pre[i] = *(unsigned char __far *)MK_FP(seg, i);
     wr(0x06, sv06 | (1 << wn));                 /* enable just our borrowed window */
     dly(20000);
 
@@ -168,6 +204,10 @@ static int mapwin(unsigned seg)
         }
         settle_polls = t;
     }
+    for (i = 0; i < 16 && pre[i] == *(unsigned char __far *)MK_FP(seg, i); i++) ;
+    win_shadowed = (i == 16);
+    for (i = 0; i < 16 && pre[i] == 0xFF; i++) ;
+    if (i == 16) win_shadowed = 0;              /* FF both ways = open bus, not RAM */
     rdy_timeout     = (cisb(seg, 0) == 0xFF);
     settle_unstable = (!rdy_timeout && settle_polls >= SETTLE_POLLS);
     settle_capped   = (settle_polls >= SETTLE_POLLS);
@@ -177,6 +217,7 @@ static int mapwin(unsigned seg)
 static void unmapwin(void)
 {
     int i;
+    wr(0x06, sv06);                         /* disable borrowed window FIRST */
     for (i = 0; i < 6; i++) wr(win_base + i, svwin[i]);   /* restore window regs  */
     wr(0x06, sv06);                                       /* restore enable byte  */
     if (we_powered) { wr(0x03, sv03); wr(0x02, sv02); }   /* power off only ours  */
@@ -209,13 +250,14 @@ static int  s_manf, s_prod, s_func;
 static long s_cor;
 static int  s_have_manf, s_have_func;
 static long s_io_base, s_io_len;
-static int  s_irq, s_def_idx, s_have_io, s_have_default;
+static unsigned s_irq;
+static int  s_have_irq, s_def_idx, s_have_io, s_have_default;
 
 static void reset_summary(void)
 {
     s_have_manf = s_have_func = s_have_io = s_have_default = 0;
     s_cor = -1; s_io_base = s_io_len = -1;
-    s_irq = -1; s_def_idx = -1; s_func = -1;
+    s_irq = 0; s_have_irq = 0; s_def_idx = -1; s_func = -1;
 }
 
 /* current tuple body, copied out of attribute space for safe indexed parsing */
@@ -227,9 +269,13 @@ static void parse_config(int full)
 {
     int rasz, rmsz, i;
     long radr = 0;
-    if (blen < 2) return;
+    if (blen < 2) { printf("    ! truncated CONFIG tuple\n"); return; }
     rasz = (body[0] & 0x03) + 1;
-    rmsz = ((body[0] >> 2) & 0x03) + 1;
+    rmsz = ((body[0] >> 2) & 0x0F) + 1;
+    if (blen < 2 + rasz + rmsz) {
+        printf("    ! truncated CONFIG address or register mask\n");
+        return;
+    }
     s_def_idx = -1;                                  /* CONFIG carries LAST, not default */
     for (i = 0; i < rasz && (2 + i) < blen; i++) radr |= (long)body[2 + i] << (8 * i);
     s_cor = radr;
@@ -256,7 +302,8 @@ static void parse_cftable(int full)
 {
     int p = 0, index, deflt, iface = -1, fs, npwr, i;
     long io_base = -1, io_len = -1;
-    int  io_lines = -1, irqno = -1, irqmask = -1, irqflags = 0;
+    int  io_lines = -1, irqno = -1, have_irqmask = 0, irqflags = 0;
+    unsigned irqmask = 0;
 
     if (blen < 1) return;
     index = body[p] & 0x3F;
@@ -311,7 +358,10 @@ irqpart:
         int ir = body[p++];
         irqflags = ir & 0xE0;
         if (ir & 0x10) {                                   /* 2-byte IRQ mask */
-            if (p + 1 < blen) irqmask = body[p] | (body[p + 1] << 8);
+            if (p + 1 < blen) {
+                irqmask = (unsigned)body[p] | ((unsigned)body[p + 1] << 8);
+                have_irqmask = 1;
+            }
             p += 2;
         } else {
             irqno = ir & 0x0F;
@@ -330,14 +380,14 @@ emit:
         if (io_base >= 0)
             printf("      -> I/O 0x%lX..0x%lX (len %ld)\n",
                    io_base, io_base + io_len - 1, io_len);
-        if (irqmask >= 0 || irqno >= 0) {
+        if (have_irqmask || irqno >= 0) {
             printf("      -> IRQ ");
             if (irqflags & 0x20) printf("level ");
             if (irqflags & 0x40) printf("pulse ");
             if (irqflags & 0x80) printf("shared ");
-            if (irqmask >= 0) {
+            if (have_irqmask) {
                 printf("mask 0x%04X {", irqmask);
-                for (i = 0; i < 16; i++) if (irqmask & (1 << i)) printf(" %d", i);
+                for (i = 0; i < 16; i++) if (irqmask & (1U << i)) printf(" %d", i);
                 printf(" }\n");
             } else {
                 printf("%d (fixed)\n", irqno);
@@ -362,8 +412,8 @@ emit:
        genuinely addressable, and take the IRQ from that same entry. */
     if (!s_have_io && io_base > 0) {
         s_io_base = io_base; s_io_len = io_len; s_have_io = 1;
-        if (irqmask >= 0)       s_irq = irqmask;
-        else if (irqno >= 0)    s_irq = 1 << irqno;
+        if (have_irqmask) { s_irq = irqmask; s_have_irq = 1; }
+        else if (irqno >= 0) { s_irq = 1U << irqno; s_have_irq = 1; }
     }
 }
 
@@ -382,6 +432,7 @@ static void parse_device(void)
 static void decode(unsigned seg, int code, int off, int full)
 {
     int i;
+    (void)seg;
     (void)off;
     switch (code) {
     case 0x15:                                          /* CISTPL_VERS_1 */
@@ -453,7 +504,7 @@ static int win_kind;
    vendor-unique 0x80-0xFE range - is not a first tuple. */
 static int plausible_first_tuple(int c)
 {
-    return c == 0x00 || c == 0x01 ||
+    return c == 0x00 || c == 0x01 || c == 0x03 || c == 0x06 ||
            (c >= 0x10 && c <= 0x23) ||          /* CHECKSUM..SWIL             */
            (c >= 0x40 && c <= 0x46);            /* VERS_2..ORG                */
 }
@@ -511,15 +562,58 @@ static void report_notcis(unsigned seg)
     }
 }
 
+/* Probe the implicit link at common offset zero without losing our mapping.
+   Only a LINKTARGET with at least three bytes and the CIS signature counts. */
+static int common_linktarget(unsigned seg)
+{
+    unsigned char enabled = rd(0x06), lo = rd(win_base + 4), hi = rd(win_base + 5);
+    unsigned char bytes[5];
+    unsigned disabled = enabled & ~(1U << ((win_base - 0x10) / 8));
+    unsigned offset = (unsigned)(0 - (seg >> 8)) & 0x3FFF;
+    int stride = rd_stride, i;
+
+    wr(0x06, disabled);
+    wr(win_base + 4, offset & 0xFF);
+    wr(win_base + 5, (offset >> 8) | (hi & 0x80));
+    wr(0x06, enabled);
+    dly(20000);
+    rd_stride = 1;
+    for (i = 0; i < 5; i++) bytes[i] = cisb(seg, i);
+    wr(0x06, disabled);
+    wr(win_base + 4, lo); wr(win_base + 5, hi);
+    wr(0x06, enabled);
+    rd_stride = stride;
+    dly(20000);
+    return bytes[0] == 0x13 && bytes[1] >= 3 &&
+           bytes[2] == 'C' && bytes[3] == 'I' && bytes[4] == 'S';
+}
+
 static void dumpcis(unsigned seg, int full)
 {
-    int off = 0, i, code, link, guard = 0;
+    int off = 0, i, code, link;
+    int partial = 0, linked = 0, no_link = 0;
+    const char *linkname, *sep;
     reset_summary();
     for (;;) {
+        if (off >= 1024) {
+            printf("  ! tuple scan limit reached before END\n");
+            partial = 1;
+            break;
+        }
         code = cisb(seg, off);
         if (code == 0xFF) { printf("  TPL FF (end)\n"); break; }
-        if (code == 0x00) { off++; if (++guard > 512) break; continue; }
+        if (code == 0x00) { off++; continue; }
+        if (off + 1 >= 1024) {
+            printf("  ! tuple header exceeds scan limit\n");
+            partial = 1;
+            break;
+        }
         link = cisb(seg, off + 1);
+        if (off + 2 + link > 1024) {
+            printf("  ! tuple body exceeds scan limit\n");
+            partial = 1;
+            break;
+        }
         /* copy the body out for safe indexed decoding */
         blen = link;
         if (blen > (int)sizeof(body)) blen = sizeof(body);
@@ -530,21 +624,36 @@ static void dumpcis(unsigned seg, int full)
         if (link > 24) printf(" ...");
         printf("\n");
 
+        /* Linked chains require mapping support beyond this linear reader. */
+        linkname = NULL;
+        if (code == 0x11) linkname = "LONGLINK_A";
+        if (code == 0x12) linkname = "LONGLINK_C";
+        if (code == 0x06) linkname = "LONGLINK_MFC";
+        if (code == 0x03) linkname = "INDIRECT";
+        if (linkname) {
+            printf("  ! %s continuation is not supported; dump is incomplete\n", linkname);
+            linked = partial = 1;
+        }
+        if (code == 0x14) no_link = 1;
         decode(seg, code, off, full);
-
-        if (link == 0xFF) break;
+        if (link == 0xFF) break;             /* return this tuple, then end */
         off += link + 2;
-        if (off > 0x400) break;
     }
 
+    if (rd_attr && !no_link && !linked && !partial && common_linktarget(seg)) {
+        printf("  ! implicit COMMON-memory continuation found at offset 0;\n"
+               "    dump is incomplete (try /COMMON)\n");
+        partial = 1;
+    }
     if (full) {
-        printf("  SUMMARY:");
-        if (s_have_manf) printf(" MANFID %04X/%04X", s_manf, s_prod);
-        if (s_have_func) printf(" | %s", funcname(s_func));
-        if (s_cor >= 0)  printf(" | COR@attr 0x%lX", s_cor);
-        if (s_def_idx >= 0) printf(" | cfg#%d", s_def_idx);
-        if (s_have_io)   printf(" | I/O 0x%lX..0x%lX", s_io_base, s_io_base + s_io_len - 1);
-        if (s_irq >= 0)  printf(" | IRQmask 0x%04X", s_irq);
+        printf("  SUMMARY%s:", partial ? " (partial)" : "");
+        sep = " ";                       /* separators only between fields */
+        if (s_have_manf) { printf("%sMANFID %04X/%04X", sep, s_manf, s_prod); sep = " | "; }
+        if (s_have_func) { printf("%s%s", sep, funcname(s_func)); sep = " | "; }
+        if (s_cor >= 0)  { printf("%sCOR@attr 0x%lX", sep, s_cor); sep = " | "; }
+        if (s_def_idx >= 0) { printf("%scfg#%d", sep, s_def_idx); sep = " | "; }
+        if (s_have_io)   { printf("%sI/O 0x%lX..0x%lX", sep, s_io_base, s_io_base + s_io_len - 1); sep = " | "; }
+        if (s_have_irq)  printf("%sIRQmask 0x%04X", sep, s_irq);
         printf("\n");
     }
 }
@@ -562,8 +671,8 @@ static int write_bin(unsigned seg, const char *fn, int len)
 
 static void usage(void)
 {
-    printf("CISDUMP 1.4 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
-    printf("Usage: CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/?]\n");
+    printf("CISDUMP 1.5 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
+    printf("Usage: CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/SEG xxxx] [/?]\n");
     printf("  /FULL /F   decode CONFIG(COR), CFTABLE(I/O,IRQ), FUNCID, +SUMMARY\n");
     printf("  /COMMON /C read COMMON memory densely, not attribute space -\n");
     printf("             for memory-only cards, and cards that ignore REG#\n");
@@ -572,9 +681,11 @@ static void usage(void)
     printf("  /VPP       drive Vpp to Vcc while powering (OFF by default - a\n");
     printf("             reader should not assert programming voltage). Only\n");
     printf("             for a card that will not read without it\n");
-    printf("  /BIN file  write the bytes as read (honours /COMMON and /RAW)\n");
+    printf("  /BIN file  write the bytes as read (honours /COMMON and /RAW; first card only)\n");
     printf("  /S n       scan only socket n (0-7; chip 3E0+(n&~1), bank (n&1))\n");
     printf("  /LEN n     CIS bytes to write for /BIN (default 512)\n");
+    printf("  /SEG xxxx  put the 16K card window at hex segment xxxx (C000-EC00,\n");
+    printf("             4K aligned; default D000) when a UMB/EMS frame sits there\n");
     printf("  /? /H      this help\n");
 }
 
@@ -582,6 +693,7 @@ int main(int argc, char **argv)
 {
     unsigned sock, seg = 0xD000;
     int full = 0, socksel = -1, binlen = 512, i, force = 0, nfound = 0;
+    int mapped, failed = 0, bin_socket = -1;
     char *binfile = NULL;
 
     for (i = 1; i < argc; i++) {
@@ -596,15 +708,36 @@ int main(int argc, char **argv)
             if (i+1 < argc && argv[i+1][0] != '/' && argv[i+1][0] != '-') binfile = argv[++i];
             else binfile = "CIS.BIN";
         }
-        else if (!stricmp(a, "S")) { if (i+1<argc) socksel = atoi(argv[++i]); }
+        else if (!stricmp(a, "S")) {
+            char *end;
+            long n;
+            if (i + 1 >= argc) { printf("/S requires a socket number 0-7\n"); return 1; }
+            n = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || n < 0 || n > 7) {
+                printf("invalid socket: %s (expected 0-7)\n", argv[i]);
+                return 1;
+            }
+            socksel = (int)n;
+        }
         else if (!stricmp(a, "LEN")||!stricmp(a,"L")) { if (i+1<argc) binlen = atoi(argv[++i]); }
+        else if (!stricmp(a, "SEG")) {
+            char *end;
+            long n;
+            if (i + 1 >= argc) { printf("/SEG requires a hex segment, e.g. /SEG DC00\n"); return 1; }
+            n = strtol(argv[++i], &end, 16);
+            if (end == argv[i] || *end || n < 0xC000L || n > 0xEC00L || (n & 0xFF)) {
+                printf("invalid segment: %s (hex C000-EC00, 4K aligned)\n", argv[i]);
+                return 1;
+            }
+            seg = (unsigned)n;
+        }
         else if (!stricmp(a, "?") || !stricmp(a, "H") || !stricmp(a, "HELP")) { usage(); return 0; }
         else { printf("unknown option: %s\n", argv[i]); usage(); return 1; }
     }
     if (binlen < 1)   binlen = 512;
     if (binlen > 1024) binlen = 1024;
 
-    printf("CISDUMP 1.4 - PCMCIA CIS reader/dumper\n");
+    printf("CISDUMP 1.5 - PCMCIA CIS reader/dumper\n");
     for (sock = 0; sock < 8; sock++) {
         if (socksel >= 0 && (int)sock != socksel) continue;
         pcic    = PCIC_BASE + (sock & ~1);
@@ -618,7 +751,19 @@ int main(int argc, char **argv)
         nfound++;
         printf("=== Socket %u (PCIC 0x%03X, bank 0x%02X, ID %02X) ===\n",
                sock, pcic, sockoff, rd(0x00));
-        if (!mapwin(seg)) { printf("  (no card present)\n"); continue; }
+        mapped = mapwin(seg);
+        if (!mapped) { printf("  (no card present)\n"); continue; }
+        if (mapped == -2) {
+            printf("  ! an enabled PCIC window already covers the 16K at %04X:0000;\n"
+                   "    socket left untouched. Move ours with /SEG xxxx\n", seg);
+            failed = 1;
+            continue;
+        }
+        if (mapped < 0) {
+            printf("  ! no free memory window; socket left untouched\n");
+            failed = 1;
+            continue;
+        }
         if (we_powered)
             printf("  [socket was off: powered up to read, will power back down]\n");
         else
@@ -641,6 +786,13 @@ int main(int argc, char **argv)
         else if (settle_unstable)
             printf("  [warning: CIS never held still over a 5s wait - the bytes below\n"
                    "   are an un-settled read, NOT this card's CIS. Re-run it]\n");
+        if (win_shadowed) {
+            printf("  ! %04X:0000 reads the same with our window disabled and enabled:\n"
+                   "    host memory (a UMB or EMS page frame) is shadowing it, so what\n"
+                   "    follows would be RAM, not the card. Move the window with /SEG\n"
+                   "    (e.g. /SEG DC00), or /FORCE to see it anyway.\n", seg);
+            if (!force) { failed = 1; unmapwin(); continue; }
+        }
         win_kind = classify(seg);
         if (win_kind == WIN_CIS || force) {
             if (win_kind != WIN_CIS)
@@ -656,12 +808,22 @@ int main(int argc, char **argv)
         } else {
             report_notcis(seg);
         }
-        if (binfile) write_bin(seg, binfile, binlen);
+        if (binfile) {
+            if (bin_socket >= 0) {
+                printf("  ! %s already used for socket %d; refusing capture from socket %u\n"
+                       "    Use /S n with a separate filename for this card.\n",
+                       binfile, bin_socket, sock);
+                failed = 1;
+            } else {
+                bin_socket = (int)sock;     /* reserve the name even if writing fails */
+                if (!write_bin(seg, binfile, binlen)) failed = 1;
+            }
+        }
         unmapwin();                                      /* polite restore */
     }
     if (!nfound)
         printf("No 82365-class PCIC found (scanned 3E0/3E2/3E4/3E6).\n"
                "A bridge in CardBus mode does not answer here - its sibling may\n"
                "still be in PCIC mode on a higher socket number.\n");
-    return 0;
+    return failed;
 }

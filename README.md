@@ -20,8 +20,10 @@ after another enabler has configured the card as an I/O device — so CISDUMP:
   was**: its power, reset, interface mode and IRQ steering are never touched.
 - **Borrows a free memory window** to reach attribute space: it scans the
   controller's window-enable register, picks the first *disabled* memory window,
-  saves that window's registers, reads, then restores the window registers and
-  the enable byte precisely — so it never clobbers the enabler's I/O windows.
+  saves that window's registers, reads, disables the borrowed window, then
+  restores the registers and enable byte. If all five memory windows are
+  occupied, it skips the socket without changing its state and returns a
+  nonzero exit status.
 - **Only powers down a card it powered up itself.** A card found already on is
   left on.
 - **Never asserts Vpp.** Vpp is the card's programming supply, and on flash it is
@@ -60,9 +62,12 @@ CISDUMP [/FULL] [/COMMON] [/RAW] [/FORCE] [/VPP] [/BIN file] [/S n] [/LEN n] [/?
   /RAW /R     do not de-interleave — read the window byte by byte
   /FORCE      parse as tuples even when the window is not a CIS
   /VPP        drive Vpp to Vcc while powering (off by default)
-  /BIN file   also write the bytes as read (honours /COMMON and /RAW)
+  /BIN file   also write the first card's bytes (honours /COMMON and /RAW);
+              refuse a second capture to the same filename
   /S n        only scan socket n (0–7, see Sockets below)
   /LEN n      number of CIS bytes for /BIN (default 512)
+  /SEG xxxx   put the 16 KB card window at hex segment xxxx (C000–EC00,
+              4 KB aligned; default D000)
   /? /H       help
 ```
 
@@ -80,6 +85,20 @@ all-`FF` window to match — a complete and entirely fictional card. Not
 hypothetical: on a ThinkPad 235 the first bridge sits in CardBus mode, so
 `0x3E0` is dead while the second answers PCIC at `0x3E4` with the card on it.
 
+### Where the window lives
+
+CISDUMP reaches the card through a 16 KB memory window at `D000:0000` by
+default. If a UMB provider or an EMS page frame owns that range, the CPU never
+reaches the card: it reads host RAM, and whatever resident sits there parses
+as a tuple chain. That happened for real — on a ThinkPad 235 with a resident
+loaded high at D000 the "CIS" ended in that program's own banner text. So
+CISDUMP samples the segment before its window goes live and again once it has
+settled: identical non-`FF` bytes both ways mean host memory is in the way,
+and it says so and skips the socket rather than decode RAM. Move the window
+with `/SEG`, for example `/SEG DC00`. It also refuses a segment that an
+enabled PCIC window on either socket of the chip already covers — two windows
+decoding one range is undefined.
+
 ### `/FULL` — decode, don't just dump
 
 `/FULL` turns the raw tuple list into the numbers you actually need:
@@ -94,12 +113,30 @@ hypothetical: on a ThinkPad 235 the first bridge sits in CardBus mode, so
   **CISTPL_VERS_1** strings.
 - A one-line **SUMMARY**: `MANFID / function / COR / default cfg# / I/O range`.
 
+The reader scans the first **1024 bytes** of the selected memory space.
+It reports `LONGLINK_A`, `LONGLINK_C`, `LONGLINK_MFC`, and `INDIRECT`
+continuations as unsupported and labels the summary **partial**. When an
+attribute chain ends without a link or `NO_LINK`, it briefly maps common
+memory at offset zero and checks for a `LINKTARGET` tuple containing `CIS`.
+Only a valid target triggers an implicit-continuation warning and partial
+summary; otherwise the chain ends silently. The probe disables the window
+before changing its offset registers and restores the original mapping and
+read stride afterward. `/COMMON` can inspect common memory starting at zero;
+it does not follow arbitrary link targets.
+Reaching the scan limit before END is also reported as a partial dump.
+
 ### `/BIN` — archive the raw CIS
 
 `/BIN file` writes the de-interleaved CIS bytes to a file (default **512**
 bytes — enough to capture cards whose MANFID sits past offset 256; use `/LEN`
 to change). It honours `/COMMON` and `/RAW`, so it can archive common memory
 or the undoubled window just as easily.
+
+`CISDUMP /FULL /BIN CARD.BIN` discovers the card without requiring its socket
+number. The first accessible card gets the filename. A second card is still
+decoded, but its capture is refused with a message and exit status 1, leaving
+the first file intact. To capture that card, use its reported socket number
+and a separate filename, for example `CISDUMP /S 4 /BIN CARD4.BIN`.
 
 ### Cards with no CIS
 
@@ -139,6 +176,17 @@ The source is plain C89 (declarations at block top, no `//`), so it also builds
 under Turbo C / other 16-bit compilers with minor tweaks. The linker's
 `cannot open math87s.lib` warning is harmless — CISDUMP uses no floating point.
 The prebuilt `CISDUMP.EXE` in this repo is built from this source, on hardware.
+
+### Host regression checks
+
+Run `python3 tests/run_tests.py` with a C compiler supporting AddressSanitizer
+and UndefinedBehaviorSanitizer (Clang or GCC). The runner checks C89 syntax,
+then compiles and executes the actual source against simulated PCIC registers
+and card memory. Build products and captures are created in a temporary
+directory. These checks cover window preservation, IRQ masks, CONFIG sizes,
+continuation probes/warnings, terminal `FF`-link tuple decoding, and `/BIN`
+discovery and overwrite prevention. They do not replace a
+16-bit Watcom build or testing on a physical card.
 
 ## How it works
 
