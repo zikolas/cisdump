@@ -41,6 +41,10 @@ after another enabler has configured the card as an I/O device — so CISDUMP:
   readable. CISDUMP instead polls byte 0 until a real tuple appears (a valid CIS
   never starts with the `0xFF` end marker), up to ~5 s, then says so if it
   stayed blank. On a fast host it exits on the first read and costs nothing.
+- **Holds RESET while Vcc comes up.** Releasing reset in the same instant as
+  power-on is fine for most cards, but a Panasonic CF-JSC101 then never drives
+  its bus and reads stable non-`FF` garbage instead of a CIS (1.2 to 1.5 lost
+  this 20 ms hold with the Vpp change; 1.51 restores it, bench-proven).
 
 It tells you which path it took:
 

@@ -139,6 +139,12 @@ static int mapwin(unsigned seg)
     /* (0x40 in status reg 0x01 = power-on).                                     */
     if (!(rd(0x01) & 0x40) && !was_io) {
         wr(0x02, want_vpp ? PWR_VPP : PWR_READ); /* Vcc 5V, Vpp off (we own it)  */
+        /* 1.51: hold RESET while Vcc comes up. 1.2 dropped this 20 ms wait
+           together with the 0x95->0xB0 change, so RESET fell before the
+           rail was good. Most cards shrug; a Panasonic CF-JSC101 then never
+           drives its bus (stable non-FF garbage, not a CIS) - 1.1 read it,
+           1.2-1.5 could not. Bench-proven on the PC110, 2026-09-20. */
+        dly(20000);
         wr(0x03, 0x40); dly(10000);             /* mem mode, reset released      */
         we_powered = 1;
     }
@@ -671,7 +677,7 @@ static int write_bin(unsigned seg, const char *fn, int len)
 
 static void usage(void)
 {
-    printf("CISDUMP 1.5 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
+    printf("CISDUMP 1.51 - PCMCIA CIS reader/dumper (Intel 82365 PCIC)\n");
     printf("Usage: CISDUMP [/FULL] [/COMMON] [/RAW] [/BIN file] [/S n] [/LEN n] [/SEG xxxx] [/?]\n");
     printf("  /FULL /F   decode CONFIG(COR), CFTABLE(I/O,IRQ), FUNCID, +SUMMARY\n");
     printf("  /COMMON /C read COMMON memory densely, not attribute space -\n");
@@ -737,7 +743,7 @@ int main(int argc, char **argv)
     if (binlen < 1)   binlen = 512;
     if (binlen > 1024) binlen = 1024;
 
-    printf("CISDUMP 1.5 - PCMCIA CIS reader/dumper\n");
+    printf("CISDUMP 1.51 - PCMCIA CIS reader/dumper\n");
     for (sock = 0; sock < 8; sock++) {
         if (socksel >= 0 && (int)sock != socksel) continue;
         pcic    = PCIC_BASE + (sock & ~1);
